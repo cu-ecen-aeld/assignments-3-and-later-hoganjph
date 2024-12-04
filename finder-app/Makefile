@@ -1,14 +1,13 @@
-ifneq ($(CROSS_COMPILE),)
-CC:=$(CROSS_COMPILE)gcc
-else
-CC=gcc
-endif
+all: writer
 
-writer :
+writer.o: writer.c
 	@echo $(CC)
-	$(CC) -Wall -Werror -o writer writer.c
+	$(CC) $(CCFLAGS) -c writer.c
+
+writer: writer.o
+	$(CC) $(LDFLAGS) writer.o -o writer
 
 .PHONY : clean
 clean :
 	rm -fr writer
-    
+
