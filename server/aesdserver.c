@@ -134,8 +134,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("is daemon: %d\n", is_daemon);
-
     // get sockaddr
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
