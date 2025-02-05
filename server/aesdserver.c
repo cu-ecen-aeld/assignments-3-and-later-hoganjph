@@ -1,4 +1,3 @@
-#include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
 #include <signal.h>
@@ -7,18 +6,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
-#include <sys/types.h>
 #include <fcntl.h>
-#include <sys/socket.h>
 #include <unistd.h>
+#include <pthread.h>
+
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/queue.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 const char temp_filename[] = "/var/tmp/aesdsocketdata";
 
 int sockfd;
-int sockfd_new;
 int logfd;
+pthread_mutex_t logfd_mutex;
 struct addrinfo *res;
-struct packet_buffer pbuf;
 
 // container to hold memory for packet buffer
 struct packet_buffer {
@@ -27,6 +30,19 @@ struct packet_buffer {
     size_t size;
 };
 
+// SLIST.
+typedef struct slist_data_s slist_data_t;
+struct slist_data_s {
+    pthread_t ptid;
+    int sockfd;
+    int complete;
+    SLIST_ENTRY(slist_data_s) entries;
+};
+
+// set up linked list to store thread data
+SLIST_HEAD(slisthead, slist_data_s) head;
+
+
 static void cleanup() {
     if (res) {
         freeaddrinfo(res);
@@ -34,18 +50,15 @@ static void cleanup() {
     if (sockfd) {
         close(sockfd);
     }
-    if (sockfd_new) {
-        close(sockfd_new);
-    }
     if (logfd) {
         close(logfd);
     }
-    free(pbuf.data);
+    pthread_mutex_destroy(&logfd_mutex);
     // delete the temp file
     remove(temp_filename);
 }
 
-void pbuf_alloc(struct packet_buffer *buf) {
+int pbuf_alloc(struct packet_buffer *buf) {
     if (!buf->data) {
         buf->data = (char*)malloc(1024);
         buf->size = 1024;
@@ -56,36 +69,52 @@ void pbuf_alloc(struct packet_buffer *buf) {
     }
     if (buf->data == NULL) {
         perror("malloc");
-        cleanup();
-        exit(1);
+        return -1;
     }
+    return 0;
 }
 
 void handle_signal(int signum) {
     if (signum == SIGINT || signum == SIGTERM) {
+        // cancel threads
+        slist_data_t *datap;
+        while(!SLIST_EMPTY(&head)) {
+            datap = SLIST_FIRST(&head);
+            if (datap->complete) {
+                if (pthread_join(datap->ptid, NULL) != 0) {
+                    printf("failed to join thread with id: %lx\n", datap->ptid);
+                }
+            } else {
+                if (pthread_cancel(datap->ptid) != 0) {
+                    perror("pthread_cancel");
+                    printf("Failed to cancel thread with id:\t%lx\n", datap->ptid);
+                }
+            }
+            SLIST_REMOVE_HEAD(&head, entries);
+        }
+
         syslog(LOG_INFO, "Caught signal, exiting");
         cleanup();
-        exit(1);
+        exit(0);
     }
 }
 
-void write_to_file(int writefd, const void* buf, size_t write_size) {
+int write_to_file(int writefd, const void* buf, size_t write_size) {
     int bytes_written = write(writefd, buf, write_size);
     if (bytes_written == -1) {
         perror("write");
-        cleanup();
-        exit(1);
+        return -1;
     } else if (bytes_written < write_size) {
         printf("Attempted to write %ld bytes, only wrote %d\n", write_size, bytes_written);
     }
+    return 0;
 }
 
-void send_temp_file(int sockfd, int tempfd) {
+int send_temp_file(int sockfd, int tempfd) {
     int pos = lseek(tempfd, 0, SEEK_SET); // seek to beginning of file
     if (pos == -1) {
         perror("lseek");
-        cleanup();
-        exit(1);
+        return -1;
     }
 
     char tempbuf[1024];
@@ -96,13 +125,135 @@ void send_temp_file(int sockfd, int tempfd) {
                 continue;
             }
             perror("read");
-            cleanup();
-            exit(1);
+            return -1;
         }
 
-        write_to_file(sockfd, tempbuf, bytes_read);
+        int ret = write_to_file(sockfd, tempbuf, bytes_read);
+        if (ret != 0) {
+            return ret;
+        }
         bytes_read = read(tempfd, tempbuf, sizeof(tempbuf));
     }
+
+    return 0;
+}
+
+// connection thread
+// params - sockfd_new, logfd (global)
+// shared data - logfd, pbuf (could refactor)
+// thread cleanup - free pbuf.data, free socket
+void *conn_func(void* params) {
+    slist_data_t *llparams = (slist_data_t *)params;
+    int sockfd = llparams->sockfd;
+    int *complete = &llparams->complete;
+
+    int rc;
+
+    // allocate pbuf structure
+    struct packet_buffer pbuf;
+    memset(&pbuf, 0, sizeof(struct packet_buffer));
+    rc = pbuf_alloc(&pbuf);
+
+    char *sop = pbuf.data;
+    while (rc == 0) {
+        // read bytes from network
+        int remaining = pbuf.size - pbuf.ptr;
+        int bytes_recv = recv(sockfd, pbuf.data + pbuf.ptr, remaining - 1, 0);
+        if (bytes_recv == -1) {
+            perror("recv");
+            break;
+        } else if (bytes_recv == 0) {
+            syslog(LOG_DEBUG, "connection terminated\n");
+            break;
+        } else {
+            // separate into packets demarcated by '\n'
+            char *last = pbuf.data + pbuf.ptr + bytes_recv;
+            *last = '\0'; // make it a null-terminated string
+            char *eop = strchr(sop, '\n');
+            while (eop != NULL) {
+                rc = pthread_mutex_lock(&logfd_mutex);
+                if (rc != 0) {
+                    printf("pthread_mutex_lock failed with %d\n", rc);
+                    break;
+                }
+
+                rc = write_to_file(logfd, sop, eop + 1 - sop);
+                if (rc != 0) {
+                    break;
+                }
+
+                rc = send_temp_file(sockfd, logfd);
+                if (rc != 0) {
+                    break;
+                }
+
+                rc = pthread_mutex_unlock(&logfd_mutex);
+                if (rc != 0) {
+                    break;
+                }
+
+                sop = eop + 1;
+                eop = strchr(sop, '\n');
+            }
+            if (sop != last) {
+                pbuf.ptr = last - pbuf.data;
+            } else {
+                pbuf.ptr = 0;
+                sop = pbuf.data;
+            }
+            if (pbuf.ptr >= pbuf.size - 1) {
+                // need to increase the size
+                char *pbuf_data_old = pbuf.data;
+                rc = pbuf_alloc(&pbuf);
+                if (rc != 0) {
+                    break;
+                }
+                // realloc could change the base pointer, need to adjust sop in that case
+                if (pbuf.data != pbuf_data_old) {
+                    sop = pbuf.data + (sop - pbuf_data_old);
+                }
+            }
+        }
+    }
+
+    // cleanup. The program flow should always reach this point
+    free(pbuf.data);
+    close(sockfd);
+
+    *complete = 1;
+
+    return NULL;
+}
+
+void timelogger_func(int signo) {
+    printf("in timelogger func\n");
+    // get RFC 2822 date format
+    // "%a, %d %b %Y %T %z"
+    char timestr[200];
+    char *timefmt = "timestamp:%a, %d %b %Y %T %z\n";
+    struct timespec ts;
+    struct tm tm;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        perror("clock_gettime");
+        return;
+    }
+    localtime_r(&ts.tv_sec, &tm);
+    if (strftime(timestr, sizeof(timestr), timefmt, &tm) == 0) {
+        perror("strftime");
+        return;
+    }
+    if (pthread_mutex_lock(&logfd_mutex)) {
+        perror("pthread_mutex_lock");
+        return;
+    }
+    write_to_file(logfd, timestr, strlen(timestr));
+    if (pthread_mutex_unlock(&logfd_mutex)) {
+        perror("pthread_mutex_unlock");
+        return;
+    }
+
+    return;
 }
 
 int main(int argc, char **argv) {
@@ -140,8 +291,6 @@ int main(int argc, char **argv) {
     hints.ai_flags = AI_PASSIVE;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-
-    //struct addrinfo *res;
 
     int status;
     if ((status = getaddrinfo(NULL, "9000", &hints, &res)) != 0) {
@@ -217,10 +366,29 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
-    // now receive data from the interface
-    memset(&pbuf, 0, sizeof(struct packet_buffer));
-    pbuf_alloc(&pbuf);
+    // initialize mutex
+    if (pthread_mutex_init(&logfd_mutex, NULL) != 0) {
+        printf("mutex initialization failed\n");
+        cleanup();
+        exit(1);
+    }
+
+    // set up a timer to log the time
+    struct itimerval delay;
     
+    signal (SIGALRM, timelogger_func);
+
+    delay.it_value.tv_sec = 10;
+    delay.it_value.tv_usec = 0;
+    delay.it_interval.tv_sec = 10;
+    delay.it_interval.tv_usec = 0;
+    status = setitimer(ITIMER_REAL, &delay, NULL);
+    if (status) {
+        perror("setitimer");
+        cleanup();
+        exit(1);
+    }
+
     while (1) {
         // listen
         if ((status = listen(sockfd, 1)) != 0) {
@@ -232,12 +400,13 @@ int main(int argc, char **argv) {
         // accept
         struct sockaddr addr_conn;
         socklen_t addr_conn_len = sizeof(addr_conn);
-        sockfd_new = accept(sockfd, &addr_conn, &addr_conn_len);
+        int sockfd_new = accept(sockfd, &addr_conn, &addr_conn_len);
         if (sockfd_new == -1) {
             perror("accept");
             cleanup();
             exit(1);
         }
+
 
         // log the connection
         char addr_conn_str [INET_ADDRSTRLEN];
@@ -245,46 +414,38 @@ int main(int argc, char **argv) {
         inet_ntop(AF_INET, &(sin->sin_addr), addr_conn_str, INET_ADDRSTRLEN);
         syslog(LOG_INFO, "Accepted connection from %s", addr_conn_str);
 
-        char *sop = pbuf.data;
-        while (1) {
-            // read bytes from network
-            int remaining = pbuf.size - pbuf.ptr;
-            int bytes_recv = recv(sockfd_new, pbuf.data + pbuf.ptr, remaining - 1, 0);
-            if (bytes_recv == -1) {
-                perror("recv");
-                cleanup();
-                exit(1);
-            } else if (bytes_recv == 0) {
-                syslog(LOG_DEBUG, "connection terminated\n");
-                break;
-            } else {
-                // separate into packets demarcated by '\n'
-                char *last = pbuf.data + pbuf.ptr + bytes_recv;
-                *last = '\0'; // make it a null-terminated string
-                char *eop = strchr(sop, '\n');
-                while (eop != NULL) {
-                    write_to_file(logfd, sop, eop + 1 - sop);
-                    send_temp_file(sockfd_new, logfd);
-                    sop = eop + 1;
-                    eop = strchr(sop, '\n');
-                }
-                if (sop != last) {
-                    pbuf.ptr = last - pbuf.data;
-                } else {
-                    pbuf.ptr = 0;
-                    sop = pbuf.data;
-                }
-                if (pbuf.ptr >= pbuf.size - 1) {
-                    // need to increase the size
-                    char *pbuf_data_old = pbuf.data;
-                    pbuf_alloc(&pbuf);
-                    // realloc could change the base pointer, need to adjust sop in that case
-                    if (pbuf.data != pbuf_data_old) {
-                        sop = pbuf.data + (sop - pbuf_data_old);
-                    }
+        slist_data_t *datap = malloc(sizeof(slist_data_t));
+        datap->sockfd = sockfd_new;
+        datap->complete = 0;
+
+        SLIST_INSERT_HEAD(&head, datap, entries);
+
+        // spawn thread with conn_func
+        int rc = pthread_create(&datap->ptid, NULL, &conn_func, (void*)datap);
+        if (rc != 0) {
+            perror("pthread_create");
+            cleanup();
+            exit(1);
+        }
+
+        // check other threads for completion
+        int done = 0;
+        while(!done) {
+            done = 1;
+            SLIST_FOREACH(datap, &head, entries) {
+                if (datap->complete == 1) {
+                    // join thread, remove from LL, and free memory
+                    pthread_join(datap->ptid, NULL);
+                    SLIST_REMOVE(&head, datap, slist_data_s, entries);
+                    free(datap);
+                    // after we remove an element, start over from the beginning
+                    // not super efficient, but at least it's safe
+                    done = 0;
+                    break;
                 }
             }
         }
+
     }
 
     cleanup();
