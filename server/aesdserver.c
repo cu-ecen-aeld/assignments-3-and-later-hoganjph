@@ -226,7 +226,6 @@ void *conn_func(void* params) {
 }
 
 void timelogger_func(int signo) {
-    printf("in timelogger func\n");
     // get RFC 2822 date format
     // "%a, %d %b %Y %T %z"
     char timestr[200];
@@ -353,13 +352,15 @@ int main(int argc, char **argv) {
 
         // redirect fds to /dev/null
         open("/dev/null", O_RDWR);
-        dup(0);
-        dup(0);
+        int ret = dup(0);
+        if (ret == -1) printf("dup failed\n");
+        ret = dup(0);
+        if (ret == -1) printf("dup failed\n");
     }
 
     // open file for appending
     int wrflags = O_RDWR | O_APPEND | O_CREAT;
-    logfd = open(temp_filename, wrflags); 
+    logfd = open(temp_filename, wrflags, S_IROTH);
     if (logfd == -1) {
         perror("open");
         cleanup();
