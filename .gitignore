@@ -1,4 +1,5 @@
 *.o
+*.swp
 writer
 Test_*_Runner.c
 build/
