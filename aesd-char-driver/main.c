@@ -61,11 +61,15 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
 
     PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
 
-    // TODO: get a lock
+    if (mutex_lock_interruptible(&aesd_device->lock)) {
+		return -ERESTARTSYS;
+	}
+
     // find the correct entry
     entry = aesd_circular_buffer_find_entry_offset_for_fpos(
             &aesd_device->buffer, *f_pos, &entry_offset);
     if (!entry) {
+		mutex_unlock(&aesd_device->lock);
         return 0;
     }
 
@@ -81,6 +85,8 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
 	*f_pos += count;
 	retval = count;
 
+	mutex_unlock(&aesd_device->lock);
+
 out:
     return retval;
 }
@@ -95,8 +101,11 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
 
+    if (mutex_lock_interruptible(&aesd_device->lock)) {
+		return -ERESTARTSYS;
+	}
+
     // TODO: handle lines without \n
-    // TODO: get a lock
     new_buf = kmalloc(count, GFP_KERNEL);
     if (!new_buf) {
         goto out;
@@ -110,6 +119,8 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     new_entry.size = count;
     aesd_circular_buffer_add_entry(&aesd_device->buffer, &new_entry);
     retval = count;
+
+	mutex_unlock(&aesd_device->lock);
 
 out:
     return retval;
