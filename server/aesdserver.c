@@ -16,10 +16,16 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
 const char temp_filename[] = "/var/tmp/aesdsocketdata";
+const char dev_driver[] = "/dev/aesdchar";
 
 int sockfd;
 int logfd;
+int devfd;
 pthread_mutex_t logfd_mutex;
 struct addrinfo *res;
 
@@ -52,6 +58,9 @@ static void cleanup() {
     }
     if (logfd) {
         close(logfd);
+    }
+    if (devfd) {
+        close(devfd);
     }
     pthread_mutex_destroy(&logfd_mutex);
     // delete the temp file
@@ -111,11 +120,13 @@ int write_to_file(int writefd, const void* buf, size_t write_size) {
 }
 
 int send_temp_file(int sockfd, int tempfd) {
-    int pos = lseek(tempfd, 0, SEEK_SET); // seek to beginning of file
-    if (pos == -1) {
-        perror("lseek");
-        return -1;
-    }
+    #if USE_AESD_CHAR_DEVICE == 0
+        int pos = lseek(tempfd, 0, SEEK_SET); // seek to beginning of file
+        if (pos == -1) {
+            perror("lseek");
+            return -1;
+        }
+    #endif /* USE_AESD_CHAR_DEVICE == 0*/
 
     char tempbuf[1024];
     size_t bytes_read = read(tempfd, tempbuf, sizeof(tempbuf));
@@ -171,26 +182,44 @@ void *conn_func(void* params) {
             *last = '\0'; // make it a null-terminated string
             char *eop = strchr(sop, '\n');
             while (eop != NULL) {
-                rc = pthread_mutex_lock(&logfd_mutex);
-                if (rc != 0) {
-                    printf("pthread_mutex_lock failed with %d\n", rc);
-                    break;
-                }
+                #if USE_AESD_CHAR_DEVICE == 1
+                    devfd = open(dev_driver, O_RDWR);
+                    if (devfd == -1) {
+                        perror("open device");
+                        break;
+                    }
+                    rc = write_to_file(devfd, sop, eop + 1 - sop);
+                    if (rc != 0) {
+                        break;
+                    }
 
-                rc = write_to_file(logfd, sop, eop + 1 - sop);
-                if (rc != 0) {
-                    break;
-                }
+                    rc = send_temp_file(sockfd, devfd);
+                    if (rc != 0) {
+                        break;
+                    }
 
-                rc = send_temp_file(sockfd, logfd);
-                if (rc != 0) {
-                    break;
-                }
+                #else
+                    rc = pthread_mutex_lock(&logfd_mutex);
+                    if (rc != 0) {
+                        printf("pthread_mutex_lock failed with %d\n", rc);
+                        break;
+                    }
 
-                rc = pthread_mutex_unlock(&logfd_mutex);
-                if (rc != 0) {
-                    break;
-                }
+                    rc = write_to_file(logfd, sop, eop + 1 - sop);
+                    if (rc != 0) {
+                        break;
+                    }
+
+                    rc = send_temp_file(sockfd, logfd);
+                    if (rc != 0) {
+                        break;
+                    }
+
+                    rc = pthread_mutex_unlock(&logfd_mutex);
+                    if (rc != 0) {
+                        break;
+                    }
+                #endif /* USE_AESD_CHAR_DEVICE */
 
                 sop = eop + 1;
                 eop = strchr(sop, '\n');
@@ -219,6 +248,9 @@ void *conn_func(void* params) {
     // cleanup. The program flow should always reach this point
     free(pbuf.data);
     close(sockfd);
+    if (devfd) {
+        close(devfd);
+    }
 
     *complete = 1;
 
@@ -358,37 +390,39 @@ int main(int argc, char **argv) {
         if (ret == -1) printf("dup failed\n");
     }
 
-    // open file for appending
-    int wrflags = O_RDWR | O_APPEND | O_CREAT;
-    logfd = open(temp_filename, wrflags, S_IROTH);
-    if (logfd == -1) {
-        perror("open");
-        cleanup();
-        exit(1);
-    }
+    #if USE_AESD_CHAR_DEVICE == 0
+        // open file for appending
+        int wrflags = O_RDWR | O_APPEND | O_CREAT;
+        logfd = open(temp_filename, wrflags, S_IROTH);
+        if (logfd == -1) {
+            perror("open");
+            cleanup();
+            exit(1);
+        }
 
-    // initialize mutex
-    if (pthread_mutex_init(&logfd_mutex, NULL) != 0) {
-        printf("mutex initialization failed\n");
-        cleanup();
-        exit(1);
-    }
+        // initialize mutex
+        if (pthread_mutex_init(&logfd_mutex, NULL) != 0) {
+            printf("mutex initialization failed\n");
+            cleanup();
+            exit(1);
+        }
 
-    // set up a timer to log the time
-    struct itimerval delay;
-    
-    signal (SIGALRM, timelogger_func);
+        // set up a timer to log the time
+        struct itimerval delay;
 
-    delay.it_value.tv_sec = 10;
-    delay.it_value.tv_usec = 0;
-    delay.it_interval.tv_sec = 10;
-    delay.it_interval.tv_usec = 0;
-    status = setitimer(ITIMER_REAL, &delay, NULL);
-    if (status) {
-        perror("setitimer");
-        cleanup();
-        exit(1);
-    }
+        signal (SIGALRM, timelogger_func);
+
+        delay.it_value.tv_sec = 10;
+        delay.it_value.tv_usec = 0;
+        delay.it_interval.tv_sec = 10;
+        delay.it_interval.tv_usec = 0;
+        status = setitimer(ITIMER_REAL, &delay, NULL);
+        if (status) {
+            perror("setitimer");
+            cleanup();
+            exit(1);
+        }
+    #endif /* USE_AESD_CHAR_DEVICE */
 
     while (1) {
         // listen
