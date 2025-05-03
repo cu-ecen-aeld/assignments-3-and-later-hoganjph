@@ -13,7 +13,7 @@
 
 #include <linux/module.h>
 #include <linux/init.h>
-#include <linux/slab.h>		/* kmalloc() */
+#include <linux/slab.h>     /* kmalloc() */
 #include <linux/printk.h>
 #include <linux/types.h>
 #include <linux/cdev.h>
@@ -62,30 +62,30 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
 
     if (mutex_lock_interruptible(&aesd_device->lock)) {
-		return -ERESTARTSYS;
-	}
+        return -ERESTARTSYS;
+    }
 
     // find the correct entry
     entry = aesd_circular_buffer_find_entry_offset_for_fpos(
-            &aesd_device->buffer, *f_pos, &entry_offset);
+        &aesd_device->buffer, *f_pos, &entry_offset);
     if (!entry) {
-		mutex_unlock(&aesd_device->lock);
+        mutex_unlock(&aesd_device->lock);
         return 0;
     }
 
-	// only write out the bytes from this entry
+    // only write out the bytes from this entry
     if (entry->size - entry_offset < count) {
         count = entry->size - entry_offset;
     }
 
-	if (copy_to_user(buf, entry->buffptr + entry_offset, count)) {
-		retval = -EFAULT;
-		goto out;
-	}
-	*f_pos += count;
-	retval = count;
+    if (copy_to_user(buf, entry->buffptr + entry_offset, count)) {
+        retval = -EFAULT;
+        goto out;
+    }
+    *f_pos += count;
+    retval = count;
 
-	mutex_unlock(&aesd_device->lock);
+    mutex_unlock(&aesd_device->lock);
 
 out:
     return retval;
@@ -95,35 +95,70 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
 {
     struct aesd_dev *aesd_device = filp->private_data;
+    struct aesd_buffer_entry *working = &aesd_device->working;
     ssize_t retval = -ENOMEM;
-    struct aesd_buffer_entry new_entry;
     char *new_buf;
 
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
 
     if (mutex_lock_interruptible(&aesd_device->lock)) {
-		return -ERESTARTSYS;
-	}
+        return -ERESTARTSYS;
+    }
+
+    if (working->buffptr) {
+        // if there is a leftover buffer, use realloc and append data to
+        // existing
+        new_buf = krealloc(
+                working->buffptr, working->size + count, GFP_KERNEL);
+        if (!new_buf) {
+            goto out;
+        }
+
+        if (copy_from_user(new_buf + working->size, buf, count)) {
+            retval = -EFAULT;
+            goto out;
+        }
+
+        working->buffptr = new_buf;
+        working->size += count;
+    } else {
+        char *new_buf = kmalloc(count, GFP_KERNEL);
+        if (!new_buf) {
+            goto out;
+        }
+        if (copy_from_user(new_buf, buf, count)) {
+            retval = -EFAULT;
+            goto out;
+        }
+
+        working->buffptr = new_buf;
+        working->size = count;
+    }
 
     // TODO: handle lines without \n
-    new_buf = kmalloc(count, GFP_KERNEL);
-    if (!new_buf) {
-        goto out;
-    }
-    if (copy_from_user(new_buf, buf, count)) {
-		retval = -EFAULT;
-        goto out;
+    char *pch = strrchr(working->buffptr, '\n');
+    if (pch) {
+        if (pch - working->buffptr < working->size - 1) {
+            // corner case, there is a \n in the middle
+            // for now, I'll ignore corner case and write the whole working buffer
+            PDEBUG("found a carriage return in middle of command\n");
+        }
+
+        const char *buf_to_free =
+            aesd_circular_buffer_add_entry(&aesd_device->buffer, working);
+        if (buf_to_free) {
+            kfree((char*)buf_to_free);
+        }
+
+        // reset the working buffer since we wrote its data to the circular
+        // buffer
+        working->buffptr = NULL;
+        working->size = 0;
     }
 
-    new_entry.buffptr = new_buf;
-    new_entry.size = count;
-    const char *buf_to_free = aesd_circular_buffer_add_entry(&aesd_device->buffer, &new_entry);
-	mutex_unlock(&aesd_device->lock);
+    mutex_unlock(&aesd_device->lock);
 
     retval = count;
-    if (buf_to_free) {
-        kfree((char*)buf_to_free);
-    }
 
 out:
     return retval;
