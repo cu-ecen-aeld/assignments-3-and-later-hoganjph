@@ -109,7 +109,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         // if there is a leftover buffer, use realloc and append data to
         // existing
         new_buf = krealloc(
-                working->buffptr, working->size + count, GFP_KERNEL);
+                working->buffptr, working->size + count + 1, GFP_KERNEL);
         if (!new_buf) {
             goto out;
         }
@@ -118,11 +118,12 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
             retval = -EFAULT;
             goto out;
         }
+        new_buf[working->size + count] = '\0';
 
         working->buffptr = new_buf;
         working->size += count;
     } else {
-        char *new_buf = kmalloc(count, GFP_KERNEL);
+        char *new_buf = kmalloc(count + 1, GFP_KERNEL);
         if (!new_buf) {
             goto out;
         }
@@ -130,6 +131,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
             retval = -EFAULT;
             goto out;
         }
+        new_buf[count] = '\0';
 
         working->buffptr = new_buf;
         working->size = count;
