@@ -15,6 +15,9 @@
 #include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
+
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1
@@ -188,9 +191,23 @@ void *conn_func(void* params) {
                         perror("open device");
                         break;
                     }
-                    rc = write_to_file(devfd, sop, eop + 1 - sop);
-                    if (rc != 0) {
-                        break;
+
+                    // check for the magic ioctl command
+                    //
+                    int write_cmd, write_cmd_offset;
+                    char line[eop - sop + 1];
+                    strncpy(line, sop, eop - sop);
+                    if (sscanf(line, "AESDCHAR_IOCSEEKTO:%d,%d", &write_cmd, &write_cmd_offset) > 0) {
+                        printf("Caught an IOCTL command: %s, %d, %d\n", line, write_cmd, write_cmd_offset);
+                        struct aesd_seekto seekto = {write_cmd, write_cmd_offset};
+                        if (ioctl(devfd, AESDCHAR_IOCSEEKTO, &seekto) != 0) {
+                            perror("ioctl");
+                        }
+                    } else {
+                        rc = write_to_file(devfd, sop, eop + 1 - sop);
+                        if (rc != 0) {
+                            break;
+                        }
                     }
 
                     rc = send_temp_file(sockfd, devfd);

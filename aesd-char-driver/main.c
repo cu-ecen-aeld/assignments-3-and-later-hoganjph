@@ -19,6 +19,7 @@
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -33,9 +34,6 @@ int aesd_open(struct inode *inode, struct file *filp)
 
     PDEBUG("open");
 
-    /**
-     * handle open
-     */
     // get a pointer to aesd_dev object
     dev = container_of(inode->i_cdev, struct aesd_dev, cdev);
     filp->private_data = dev;
@@ -49,6 +47,97 @@ int aesd_release(struct inode *inode, struct file *filp)
 
     // not sure if there is anything to do here
     return 0;
+}
+
+loff_t aesd_llseek(struct file *filp, loff_t off, int whence) {
+    uint8_t index;
+    struct aesd_buffer_entry *entry;
+	loff_t new_off;
+	loff_t dev_size = 0;
+	struct aesd_dev *aesd_device = filp->private_data;
+
+	PDEBUG("llseek");
+
+	// get total size of file
+    if (mutex_lock_interruptible(&aesd_device->lock)) {
+        return -ERESTARTSYS;
+    }
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &aesd_device->buffer, index) {
+        dev_size += (loff_t)entry->size;
+    }
+    mutex_unlock(&aesd_device->lock);
+
+    new_off = fixed_size_llseek(filp, off, whence, dev_size);
+
+    if (new_off < 0) return -EINVAL;
+    filp->f_pos = new_off;
+    return new_off;
+}
+
+static long aesd_adjust_file_offset(struct file *filp, int write_cmd, int write_cmd_offset) {
+    int buff_idx;
+    int index;
+    int cmds_in_buffer;
+    size_t new_off = 0;
+	struct aesd_dev *aesd_device = filp->private_data;
+	struct aesd_circular_buffer buffer = aesd_device->buffer;
+
+    if (mutex_lock_interruptible(&aesd_device->lock)) {
+        return -ERESTARTSYS;
+    }
+
+    cmds_in_buffer = buffer.full ? AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED : 
+                                   (buffer.in_offs + AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED - buffer.out_offs) 
+                                    % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    if (write_cmd >= cmds_in_buffer) {
+        return -EINVAL;
+    }
+
+    // starting from read pointer, add up the size of first write_cmd entries
+    buff_idx = buffer.out_offs;
+    for (index = 0; index < write_cmd; index++) {
+        new_off += buffer.entry[buff_idx].size;
+        INCR_OFFSET(buff_idx);
+    }
+    // next, bounds check write_cmd_offset then add that number to the new
+    // offset
+    if (write_cmd_offset >= buffer.entry[buff_idx].size) {
+        return -EINVAL;
+    }
+    mutex_unlock(&aesd_device->lock);
+
+    new_off += write_cmd_offset;
+    filp->f_pos = new_off;
+    return new_off;
+}
+
+long aesd_ioctl(struct file *filp,
+                unsigned int cmd, unsigned long arg) {
+	long retval = 0;
+    
+	PDEBUG("ioctl");
+	/*
+	 * extract the type and number bitfields, and don't decode
+	 * wrong cmds: return ENOTTY (inappropriate ioctl) before access_ok()
+	 */
+	if (_IOC_TYPE(cmd) != AESD_IOC_MAGIC) return -ENOTTY;
+	if (_IOC_NR(cmd) > AESDCHAR_IOC_MAXNR) return -ENOTTY;
+
+	switch(cmd) {
+        case AESDCHAR_IOCSEEKTO: {
+            struct aesd_seekto seekto;
+            if (copy_from_user(&seekto, (const void __user *)arg, sizeof(struct aesd_seekto))) {
+                retval = -EFAULT;
+            } else {
+                retval = aesd_adjust_file_offset(filp, seekto.write_cmd, seekto.write_cmd_offset);
+            }
+            break;
+        }
+	    default:  /* redundant, as cmd was checked against MAXNR */
+            return -ENOTTY;
+    }
+
+	return retval;
 }
 
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
@@ -137,7 +226,6 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         working->size = count;
     }
 
-    // TODO: handle lines without \n
     char *pch = strrchr(working->buffptr, '\n');
     if (pch) {
         if (pch - working->buffptr < working->size - 1) {
@@ -168,6 +256,8 @@ out:
 
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
+    .llseek =   aesd_llseek,
+	.unlocked_ioctl = aesd_ioctl,
     .read =     aesd_read,
     .write =    aesd_write,
     .open =     aesd_open,
